@@ -1,0 +1,28 @@
+seed=20260220
+checkpoint=c:\Users\UC\Desktop\Irregular-Object-Packing-main\logs\packing_hrl.pt
+mode=hierarchical
+steps=10/20
+packed=10 remaining=0
+selected_objects:
+  - YcbMediumClamp
+  - YcbPear
+  - YcbGelatinBox
+  - YcbTennisBall
+  - YcbMasterChefCan
+  - YcbTomatoSoupCan
+  - YcbBanana
+  - YcbChipsCan
+  - YcbStrawberry
+  - YcbPottedMeatCan
+packed_objects:
+  - YcbChipsCan
+  - YcbMasterChefCan
+  - YcbTomatoSoupCan
+  - YcbPottedMeatCan
+  - YcbPear
+  - YcbBanana
+  - YcbTennisBall
+  - YcbGelatinBox
+  - YcbMediumClamp
+  - YcbStrawberry
+remaining_objects:
