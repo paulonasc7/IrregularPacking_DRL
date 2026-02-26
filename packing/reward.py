@@ -13,10 +13,11 @@ class RewardWeights:
     # --- Per-step shaping weights (used in transition_reward) ---
     # delta_* terms telescope (sum = final - initial), so also add step_* terms
     # for a dense non-telescoping signal that rewards high density throughout.
-    delta_compactness_bonus: float = 0.40   # reward per-step compactness improvement
-    delta_pyramidality_bonus: float = 0.40  # reward per-step pyramidality improvement
-    step_density_bonus: float = 0.20        # reward current objective value each step
-    height_growth_penalty: float = 0.10     # penalise height growth (lower build = less print time)
+    delta_compactness_bonus: float = 0.30   # reward per-step compactness improvement
+    delta_pyramidality_bonus: float = 0.30  # reward per-step pyramidality improvement
+    step_density_bonus: float = 0.10        # reward current objective value each step
+    volume_gain_bonus: float = 1.5          # reward for packing more volume (scaled by box volume)
+    height_growth_penalty: float = 0.05     # penalise height growth (lower build = less print time)
 
     # --- Removed for SLS (kept at 0 for API compatibility) ---
     stability: float = 0.0        # powder supports all parts - irrelevant
@@ -157,14 +158,20 @@ def transition_reward(
 
     # Height growth penalty: lower build height = less SLS print time.
     box_h = max(1e-8, float(box_size[2]))
+    box_volume = float(box_size[0]) * float(box_size[1]) * float(box_size[2])
     prev_h = max(0.0, float(prev_info["max_height"]))
     next_h = max(0.0, float(next_info["max_height"]))
     height_growth = max(0.0, (next_h - prev_h) / box_h)
+
+    # Volume gain: reward packing more mesh volume (incentivizes packing more items).
+    # Normalized by box volume so the term is comparable to other [0,1] metrics.
+    volume_gain = max(0.0, (next_packed_parts_volume - prev_packed_parts_volume) / max(1e-8, box_volume))
 
     reward = (
         float(weights.delta_compactness_bonus) * delta_compactness
         + float(weights.delta_pyramidality_bonus) * delta_pyramidality
         + float(weights.step_density_bonus) * step_density
+        + float(weights.volume_gain_bonus) * volume_gain
         - float(weights.height_growth_penalty) * height_growth
     )
 
@@ -174,6 +181,7 @@ def transition_reward(
         "delta_compactness": float(delta_compactness),
         "delta_pyramidality": float(delta_pyramidality),
         "step_density": float(step_density),
+        "volume_gain": float(volume_gain),
         "height_growth": float(height_growth),
         "compact_gain": float(delta_compactness),   # kept for logging compatibility
         "pyramid_gain": float(delta_pyramidality),  # kept for logging compatibility
