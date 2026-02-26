@@ -306,6 +306,8 @@ def rollout_episode(
     ep_compact_gains: list[float] = []
     ep_pyramid_gains: list[float] = []
     ep_height_growths: list[float] = []
+    final_compactness = 0.0
+    final_pyramidality = 0.0
     manager_transitions: list[QTransition] = []
     worker_transitions: list[QTransition] = []
 
@@ -383,6 +385,9 @@ def rollout_episode(
         ep_compact_gains.append(float(reward_info.get("compact_gain", 0.0)))
         ep_pyramid_gains.append(float(reward_info.get("pyramid_gain", 0.0)))
         ep_height_growths.append(float(reward_info.get("height_growth", 0.0)))
+        # Track final state metrics for logging
+        final_compactness = float(reward_info.get("next_compactness", 0.0))
+        final_pyramidality = float(reward_info.get("next_pyramidality", 0.0))
 
         if done or len(next_state["unpacked"]) == 0:
             next_m_max_q = 0.0
@@ -439,12 +444,21 @@ def rollout_episode(
             break
 
     success = 1.0 if len(state["unpacked"]) == 0 else 0.0
+    packed_count = len(state["packed"])
+    # Compute final height ratio
+    final_hm = state["box_heightmap"]
+    final_max_h = float(np.max(final_hm)) if final_hm.size > 0 else 0.0
+    height_ratio = final_max_h / max(1e-8, float(env.box_size[2]))
     return {
         "reward": float(ep_reward),
         "success": float(success),
+        "packed_count": int(packed_count),
         "mean_compact_gain": float(np.mean(ep_compact_gains)) if ep_compact_gains else 0.0,
         "mean_pyramid_gain": float(np.mean(ep_pyramid_gains)) if ep_pyramid_gains else 0.0,
         "mean_height_growth": float(np.mean(ep_height_growths)) if ep_height_growths else 0.0,
+        "final_compactness": float(final_compactness),
+        "final_pyramidality": float(final_pyramidality),
+        "height_ratio": float(height_ratio),
         "manager_transitions": manager_transitions,
         "worker_transitions": worker_transitions,
         "elapsed_sec": float(time.time() - ep_start),
@@ -622,6 +636,7 @@ def main() -> None:
     if torch.cuda.is_available() and not args.cpu:
         device = torch.device("cuda")
     print(f"device={device}")
+    print("columns: ep=episode phase=W(worker)|J(joint) R=total_reward packed=items C=compactness P=pyramidality H=height_ratio dC/dP=step_gains eps=epsilon w/m_loss=Q_losses sec=time")
 
     if device.type == "cuda" and args.num_workers > 1 and not args.allow_secondary_multiprocess:
         print("note=single_process_cuda_primary forcing_num_workers=1 (set --allow_secondary_multiprocess to override)")
@@ -788,8 +803,31 @@ def main() -> None:
         os.replace(tmp_path, path)
         print(f"checkpoint_saved ep={ep_idx+1} path={path}")
 
+    # Tracking lists for periodic summary stats
+    recent_rewards: list[float] = []
+    recent_packed: list[int] = []
+    recent_C: list[float] = []
+    recent_P: list[float] = []
+    recent_H: list[float] = []
+    summary_interval = 50  # Print summary every N episodes
+
     def process_episode_result(ep_idx: int, ep_result: dict[str, Any]) -> None:
         nonlocal best_success, global_step
+
+        # Track for summary
+        recent_rewards.append(float(ep_result["reward"]))
+        recent_packed.append(int(ep_result.get("packed_count", 0)))
+        recent_C.append(float(ep_result.get("final_compactness", 0.0)))
+        recent_P.append(float(ep_result.get("final_pyramidality", 0.0)))
+        recent_H.append(float(ep_result.get("height_ratio", 0.0)))
+        # Keep only last N for memory
+        max_track = 200
+        if len(recent_rewards) > max_track:
+            recent_rewards.pop(0)
+            recent_packed.pop(0)
+            recent_C.pop(0)
+            recent_P.pop(0)
+            recent_H.pop(0)
 
         manager_transitions = [
             _deserialize_transition(t) for t in ep_result["manager_transitions"]
@@ -894,19 +932,28 @@ def main() -> None:
             avg_wl = float(np.mean(w_losses)) if w_losses else float("nan")
             print(
                 f"ep={ep_idx+1}/{args.episodes} "
-                f"phase={'joint' if is_joint_phase else 'worker_pretrain'} "
-                f"reward={ep_result['reward']:.3f} "
-                f"success={int(success)} "
-                f"eps={epsilon_by_episode(ep_idx, args.eps_start, args.eps_end, args.eps_decay):.3f} "
-                f"m_loss={avg_ml:.4f} "
+                f"phase={'joint' if is_joint_phase else 'W'} "
+                f"R={ep_result['reward']:.3f} "
+                f"packed={ep_result.get('packed_count', 0)} "
+                f"C={ep_result.get('final_compactness', 0.0):.3f} "
+                f"P={ep_result.get('final_pyramidality', 0.0):.3f} "
+                f"H={ep_result.get('height_ratio', 0.0):.3f} "
+                f"dC={ep_result.get('mean_compact_gain', 0.0):.4f} "
+                f"dP={ep_result.get('mean_pyramid_gain', 0.0):.4f} "
+                f"eps={epsilon_by_episode(ep_idx, args.eps_start, args.eps_end, args.eps_decay):.2f} "
                 f"w_loss={avg_wl:.4f} "
-                f"moving_success={moving_success:.3f} "
-                f"m_replay={len(manager_replay)} "
-                f"w_replay={len(worker_replay)} "
-                f"mean_compact_gain={ep_result.get('mean_compact_gain', 0.0):.5f} "
-                f"mean_pyramid_gain={ep_result.get('mean_pyramid_gain', 0.0):.5f} "
-                f"mean_height_growth={ep_result.get('mean_height_growth', 0.0):.5f} "
-                f"elapsed_sec={ep_result['elapsed_sec']:.2f}"
+                f"m_loss={avg_ml:.4f} "
+                f"sec={ep_result['elapsed_sec']:.1f}"
+            )
+        # Periodic summary stats
+        if (ep_idx + 1) % summary_interval == 0 and len(recent_rewards) >= 10:
+            print(
+                f"--- SUMMARY last {len(recent_rewards)} eps: "
+                f"R={np.mean(recent_rewards):.3f}±{np.std(recent_rewards):.3f} "
+                f"packed={np.mean(recent_packed):.1f}±{np.std(recent_packed):.1f} "
+                f"C={np.mean(recent_C):.3f}±{np.std(recent_C):.3f} "
+                f"P={np.mean(recent_P):.3f}±{np.std(recent_P):.3f} "
+                f"H={np.mean(recent_H):.3f}±{np.std(recent_H):.3f}"
             )
 
     if args.num_workers == 1:

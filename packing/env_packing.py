@@ -49,6 +49,10 @@ class PackingEnv:
 
         self._catalog_dims = [self._estimate_dims_from_urdf(path) for path in self._catalog["path"].tolist()]
         self._catalog_volumes = [self._estimate_volume_from_urdf(path) for path in self._catalog["path"].tolist()]
+        # Cache raw mesh vertices (centered) for accurate heightmap computation
+        self._catalog_mesh_vertices: list[np.ndarray | None] = [
+            self._load_mesh_vertices_from_urdf(path) for path in self._catalog["path"].tolist()
+        ]
 
         self.loaded_ids: list[int] = []
         self.loaded_catalog_idx: list[int] = []
@@ -159,6 +163,107 @@ class PackingEnv:
         
         return abs(total_volume)
 
+    def _load_mesh_vertices_from_urdf(self, urdf_path: str) -> np.ndarray | None:
+        """Load and densify mesh surface from URDF for accurate heightmap projection.
+        
+        Samples points along triangle faces to ensure dense coverage when projected
+        to the XY plane. Returns points as (N, 3) array centered at origin.
+        """
+        try:
+            root = ET.parse(urdf_path).getroot()
+        except Exception:
+            return None
+        
+        mesh_node = root.find(".//collision/geometry/mesh")
+        if mesh_node is None:
+            mesh_node = root.find(".//visual/geometry/mesh")
+        if mesh_node is None:
+            return None
+        
+        filename = mesh_node.attrib.get("filename", "").strip()
+        if not filename:
+            return None
+        
+        mesh_path = filename if os.path.isabs(filename) else os.path.join(os.path.dirname(urdf_path), filename)
+        
+        # Get scale from URDF
+        scale_text = mesh_node.attrib.get("scale", "1 1 1")
+        try:
+            scale = np.array([float(x) for x in scale_text.split()], dtype=np.float64)
+            if scale.size != 3:
+                scale = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+        except Exception:
+            scale = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+        
+        # Load vertices and faces from OBJ
+        vertices: list[np.ndarray] = []
+        faces: list[tuple[int, int, int]] = []
+        try:
+            with open(mesh_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("v "):
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            v = np.array([float(parts[1]), float(parts[2]), float(parts[3])], dtype=np.float64)
+                            vertices.append(v * scale)
+                    elif line.startswith("f "):
+                        parts = line.split()[1:]
+                        indices = []
+                        for p in parts:
+                            idx_str = p.split("/")[0]
+                            try:
+                                indices.append(int(idx_str) - 1)
+                            except ValueError:
+                                pass
+                        if len(indices) >= 3:
+                            for i in range(1, len(indices) - 1):
+                                faces.append((indices[0], indices[i], indices[i + 1]))
+        except Exception:
+            return None
+        
+        if len(vertices) < 4:
+            return None
+        
+        verts = np.stack(vertices, axis=0)
+        
+        # Densify: sample additional points on triangle surfaces
+        # Target ~3mm spacing for heightmap projection (similar to box pixel size)
+        target_spacing = 0.003
+        pts_list = [verts]  # Start with original vertices
+        
+        for i0, i1, i2 in faces:
+            if i0 >= len(verts) or i1 >= len(verts) or i2 >= len(verts):
+                continue
+            v0, v1, v2 = verts[i0], verts[i1], verts[i2]
+            # Compute edge lengths
+            e01 = np.linalg.norm(v1 - v0)
+            e02 = np.linalg.norm(v2 - v0)
+            e12 = np.linalg.norm(v2 - v1)
+            max_edge = max(e01, e02, e12)
+            # Subdivision level based on largest edge
+            n_subdiv = max(1, int(np.ceil(max_edge / target_spacing)))
+            if n_subdiv > 1:
+                # Sample using barycentric coordinates
+                for j in range(1, n_subdiv):
+                    for k in range(1, n_subdiv - j):
+                        u = j / n_subdiv
+                        v = k / n_subdiv
+                        w = 1.0 - u - v
+                        pt = w * v0 + u * v1 + v * v2
+                        pts_list.append(pt.reshape(1, 3))
+        
+        pts = np.concatenate(pts_list, axis=0)
+        # Cap total points to limit memory
+        if pts.shape[0] > 50000:
+            indices = np.random.default_rng(42).choice(pts.shape[0], 50000, replace=False)
+            pts = pts[indices]
+        
+        # Center at origin
+        centroid = np.mean(pts, axis=0)
+        pts = pts - centroid
+        return pts
+
     def _estimate_volume_from_urdf(self, urdf_path: str) -> float:
         """Estimate actual mesh volume from URDF, falling back to AABB if mesh parsing fails."""
         try:
@@ -259,7 +364,15 @@ class PackingEnv:
             self.loaded_scales.append(scale)
             self._item_dims[item_id] = (float(dims[0]), float(dims[1]), float(dims[2]))
             self._item_volumes[item_id] = float(volume)
-            self._item_local_points[item_id] = self._build_local_points(self._item_dims[item_id])
+            
+            # Use actual mesh vertices when available for accurate heightmap
+            base_mesh = self._catalog_mesh_vertices[catalog_idx]
+            if base_mesh is not None:
+                # Scale mesh vertices uniformly
+                self._item_local_points[item_id] = base_mesh * scale
+            else:
+                # Fallback to AABB grid sampling
+                self._item_local_points[item_id] = self._build_local_points(self._item_dims[item_id])
 
     def _remove_all_items(self) -> None:
         self.loaded_ids = []
@@ -404,13 +517,24 @@ class PackingEnv:
             torch.stack([r20, r21, r22]),
         ], dim=0)
 
-    @staticmethod
-    def _build_local_points(dims: tuple[float, float, float]) -> np.ndarray:
+    def _build_local_points(self, dims: tuple[float, float, float]) -> np.ndarray:
         dx, dy, dz = [float(v) for v in dims]
-        # Cache dense volume samples once per item to avoid rebuilding per orientation.
-        nx = max(6, int(np.ceil(dx / 0.01)))
-        ny = max(6, int(np.ceil(dy / 0.01)))
-        nz = max(6, int(np.ceil(dz / 0.01)))
+        # Use intermediate sampling (~3mm) - coarser than heightmap pixels (1.28mm) but
+        # finer than original 1cm. This balances pyramidality accuracy with not
+        # over-blocking from full AABB approximation.
+        # TODO: Ideally use actual mesh vertices for true irregular shape representation.
+        step = 0.003  # 3mm sampling
+        nx = max(6, int(np.ceil(dx / step)))
+        ny = max(6, int(np.ceil(dy / step)))
+        nz = max(6, int(np.ceil(dz / step)))
+        # Cap total points to avoid memory explosion for large items
+        max_pts = 50_000
+        total = nx * ny * nz
+        if total > max_pts:
+            scale = (max_pts / total) ** (1/3)
+            nx = max(6, int(nx * scale))
+            ny = max(6, int(ny * scale))
+            nz = max(6, int(nz * scale))
         xs = np.linspace(-dx / 2.0, dx / 2.0, nx, dtype=np.float64)
         ys = np.linspace(-dy / 2.0, dy / 2.0, ny, dtype=np.float64)
         zs = np.linspace(-dz / 2.0, dz / 2.0, nz, dtype=np.float64)

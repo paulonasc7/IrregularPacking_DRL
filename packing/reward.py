@@ -80,12 +80,15 @@ def _heightmap_metrics(
     else:
         occ_bbox_area = 0.0
 
-    compactness = packed_parts_volume / max(eps, occ_bbox_area * max_h)
+    envelope_volume = occ_bbox_area * max_h  # bounding box envelope
+    compactness = packed_parts_volume / max(eps, envelope_volume)
     compactness = float(np.clip(compactness, 0.0, 1.0))
 
-    # Pyramidality requested: V(parts_packed) / occupied_volume_proxy.
-    pyramidality = packed_parts_volume / max(eps, occupied_volume)
-    pyramidality = float(np.clip(pyramidality, 0.0, 1.0))
+    # Pyramidality per paper: P = mesh_vol / occupied_vol (projection to floor).
+    # P = 1.0 means perfect stacking (no vertical gaps).
+    # P < 1.0 means gaps/voids exist under or between parts.
+    pyramidality_raw = packed_parts_volume / max(eps, occupied_volume)
+    pyramidality = float(np.clip(pyramidality_raw, 0.0, 1.0))
 
     return occupied_volume, max_h, compactness, pyramidality
 
