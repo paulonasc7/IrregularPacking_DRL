@@ -14,12 +14,12 @@ class RewardWeights:
     # delta_* terms telescope (sum = final - initial), so also add step_* terms
     # for a dense non-telescoping signal that rewards high density throughout.
     # item_placement_bonus: fixed reward per item packed (size-independent)
-    item_placement_bonus: float = 0.5       # fixed bonus per item packed (KEY: drives item count)
-    delta_compactness_bonus: float = 0.05   # reward per-step compactness improvement
-    delta_pyramidality_bonus: float = 0.05  # reward per-step pyramidality improvement
-    step_density_bonus: float = 0.02        # reward current objective value each step
+    item_placement_bonus: float = 1.0       # DOMINANT: only care about packing more items
+    delta_compactness_bonus: float = 0.0    # disabled - was causing agent to prefer few dense items
+    delta_pyramidality_bonus: float = 0.0   # disabled - was causing agent to prefer few dense items
+    step_density_bonus: float = 0.0         # disabled - was causing agent to prefer few dense items
     volume_gain_bonus: float = 0.0          # disabled - replaced by item_placement_bonus
-    height_growth_penalty: float = 0.01     # penalise height growth (lower build = less print time)
+    height_growth_penalty: float = 0.0      # disabled - let agent focus purely on item count
 
     # --- Removed for SLS (kept at 0 for API compatibility) ---
     stability: float = 0.0        # powder supports all parts - irrelevant
