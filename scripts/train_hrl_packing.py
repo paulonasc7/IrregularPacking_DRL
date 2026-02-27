@@ -311,6 +311,13 @@ def rollout_episode(
     manager_transitions: list[QTransition] = []
     worker_transitions: list[QTransition] = []
 
+    # Diagnostic tracking for manager effectiveness
+    m_exploit_count = 0
+    m_explore_count = 0
+    m_q_maxes: list[float] = []  # max Q across candidates
+    m_q_spreads: list[float] = []  # max - min Q (confidence)
+    m_chosen_ranks: list[int] = []  # rank of chosen item by volume (0=largest)
+
     # Cache for worker candidates to avoid recomputation
     # Format: (item_id, candidates) - reused if next iteration selects same item
     cached_w_cands: tuple[int, list[dict]] | None = None
@@ -328,10 +335,27 @@ def rollout_episode(
             m_scalars = np.stack([c[1] for c in m_cands], axis=0).astype(np.float32)
             m_items = [c[2] for c in m_cands]
 
+            # Compute Q-values for diagnostics
+            with torch.no_grad():
+                map_t = torch.from_numpy(m_maps).to(device)
+                scalar_t = torch.from_numpy(m_scalars).to(device)
+                q_vals = manager_q(map_t, scalar_t).cpu().numpy().flatten()
+            m_q_maxes.append(float(np.max(q_vals)))
+            m_q_spreads.append(float(np.max(q_vals) - np.min(q_vals)))
+
             if rng.random() < epsilon:
                 m_idx = int(rng.integers(0, len(m_items)))
+                m_explore_count += 1
             else:
-                m_idx = argmax_q_index(manager_q, m_maps, m_scalars, device)
+                m_idx = int(np.argmax(q_vals))
+                m_exploit_count += 1
+
+            # Track rank of chosen item by volume (0=largest)
+            item_vols = [env.item_volume(iid) for iid in m_items]
+            vol_ranks = np.argsort(item_vols)[::-1]  # descending
+            chosen_rank = int(np.where(vol_ranks == m_idx)[0][0])
+            m_chosen_ranks.append(chosen_rank)
+
             chosen_m_map = m_maps[m_idx]
             chosen_m_scalar = m_scalars[m_idx]
             item_id = m_items[m_idx]
@@ -449,6 +473,14 @@ def rollout_episode(
     final_hm = state["box_heightmap"]
     final_max_h = float(np.max(final_hm)) if final_hm.size > 0 else 0.0
     height_ratio = final_max_h / max(1e-8, float(env.box_size[2]))
+
+    # Manager diagnostics
+    m_total = m_exploit_count + m_explore_count
+    m_exploit_rate = float(m_exploit_count / max(1, m_total))
+    m_mean_q_max = float(np.mean(m_q_maxes)) if m_q_maxes else 0.0
+    m_mean_q_spread = float(np.mean(m_q_spreads)) if m_q_spreads else 0.0
+    m_mean_rank = float(np.mean(m_chosen_ranks)) if m_chosen_ranks else 0.0
+
     return {
         "reward": float(ep_reward),
         "success": float(success),
@@ -462,6 +494,11 @@ def rollout_episode(
         "manager_transitions": manager_transitions,
         "worker_transitions": worker_transitions,
         "elapsed_sec": float(time.time() - ep_start),
+        # Diagnostics
+        "m_exploit_rate": m_exploit_rate,
+        "m_mean_q_max": m_mean_q_max,
+        "m_mean_q_spread": m_mean_q_spread,
+        "m_mean_rank": m_mean_rank,
     }
 
 
@@ -539,6 +576,15 @@ def rollout_worker_task(task: dict[str, Any]) -> dict[str, Any]:
         "elapsed_sec": float(result["elapsed_sec"]),
         "manager_transitions": [_serialize_transition(t) for t in result["manager_transitions"]],
         "worker_transitions": [_serialize_transition(t) for t in result["worker_transitions"]],
+        # Diagnostics
+        "packed_count": int(result.get("packed_count", 0)),
+        "final_compactness": float(result.get("final_compactness", 0.0)),
+        "final_pyramidality": float(result.get("final_pyramidality", 0.0)),
+        "height_ratio": float(result.get("height_ratio", 0.0)),
+        "m_exploit_rate": float(result.get("m_exploit_rate", 0.0)),
+        "m_mean_q_max": float(result.get("m_mean_q_max", 0.0)),
+        "m_mean_q_spread": float(result.get("m_mean_q_spread", 0.0)),
+        "m_mean_rank": float(result.get("m_mean_rank", 0.0)),
     }
 
 
@@ -809,6 +855,8 @@ def main() -> None:
     recent_C: list[float] = []
     recent_P: list[float] = []
     recent_H: list[float] = []
+    recent_m_losses: list[float] = []  # Track manager losses across episodes
+    recent_w_losses: list[float] = []  # Track worker losses across episodes
     summary_interval = 50  # Print summary every N episodes
 
     def process_episode_result(ep_idx: int, ep_result: dict[str, Any]) -> None:
@@ -927,9 +975,25 @@ def main() -> None:
                 args.save_path,
             )
 
+        # Track running losses for better visibility
+        if m_losses:
+            recent_m_losses.extend(m_losses)
+            while len(recent_m_losses) > 100:
+                recent_m_losses.pop(0)
+        if w_losses:
+            recent_w_losses.extend(w_losses)
+            while len(recent_w_losses) > 100:
+                recent_w_losses.pop(0)
+
         if (ep_idx + 1) % args.log_every == 0 or ep_idx == 0:
-            avg_ml = float(np.mean(m_losses)) if m_losses else float("nan")
-            avg_wl = float(np.mean(w_losses)) if w_losses else float("nan")
+            # Use running average for manager loss to avoid nan on non-update episodes
+            avg_ml = float(np.mean(recent_m_losses)) if recent_m_losses else float("nan")
+            avg_wl = float(np.mean(recent_w_losses)) if recent_w_losses else float("nan")
+            # Manager diagnostics (only in joint phase)
+            m_expl = ep_result.get("m_exploit_rate", 0.0)
+            m_qmax = ep_result.get("m_mean_q_max", 0.0)
+            m_qspread = ep_result.get("m_mean_q_spread", 0.0)
+            m_rank = ep_result.get("m_mean_rank", 0.0)
             print(
                 f"ep={ep_idx+1}/{args.episodes} "
                 f"phase={'joint' if is_joint_phase else 'W'} "
@@ -937,12 +1001,13 @@ def main() -> None:
                 f"packed={ep_result.get('packed_count', 0)} "
                 f"C={ep_result.get('final_compactness', 0.0):.3f} "
                 f"P={ep_result.get('final_pyramidality', 0.0):.3f} "
-                f"H={ep_result.get('height_ratio', 0.0):.3f} "
-                f"dC={ep_result.get('mean_compact_gain', 0.0):.4f} "
-                f"dP={ep_result.get('mean_pyramid_gain', 0.0):.4f} "
                 f"eps={epsilon_by_episode(ep_idx, args.eps_start, args.eps_end, args.eps_decay):.2f} "
                 f"w_loss={avg_wl:.4f} "
                 f"m_loss={avg_ml:.4f} "
+                f"m_expl={m_expl:.2f} "
+                f"m_Qmax={m_qmax:.3f} "
+                f"m_Qsprd={m_qspread:.3f} "
+                f"m_rank={m_rank:.1f} "
                 f"sec={ep_result['elapsed_sec']:.1f}"
             )
         # Periodic summary stats
