@@ -660,6 +660,11 @@ def main() -> None:
                         help="Use diverse item orderings during pre-training phase")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping (0 to disable)")
+    parser.add_argument("--cpu_replay", action="store_true", default=True,
+                        help="Store replay buffer on CPU (default: True). GPU replay competes with U-Net "
+                             "activations for VRAM and causes OOM on 16GB GPUs. Set --no_cpu_replay to "
+                             "attempt GPU storage (will auto-fallback to CPU on OOM anyway).")
+    parser.add_argument("--no_cpu_replay", dest="cpu_replay", action="store_false")
     parser.add_argument("--checkpoint_every", type=int, default=50,
                         help="Save a resumable checkpoint every N episodes (0 to disable)")
     parser.add_argument("--checkpoint_path", type=str, default="logs/checkpoint_hrl.pt",
@@ -757,15 +762,21 @@ def main() -> None:
         manager_scheduler = None
         worker_scheduler = None
 
+    # Force replay to CPU when gpu memory is needed for U-Net forward/backward passes.
+    # On 16GB GPUs the simulator already occupies ~15 GiB, leaving no headroom for
+    # GPU replay storage alongside batch-128 U-Net activations.
+    replay_storage_device = None if args.cpu_replay else (device if device.type == "cuda" else None)
+    if args.cpu_replay and device.type == "cuda":
+        print("note=replay_storage=cpu (--cpu_replay is set; frees VRAM for U-Net training)")
     replay = HierarchicalReplay(
         manager=ReplayBuffer(
             args.replay_size,
-            storage_device=(device if device.type == "cuda" else None),
+            storage_device=replay_storage_device,
             allow_cpu_fallback_on_oom=True,
         ),
         worker=ReplayBuffer(
             args.replay_size,
-            storage_device=(device if device.type == "cuda" else None),
+            storage_device=replay_storage_device,
             allow_cpu_fallback_on_oom=True,
         ),
     )
