@@ -602,11 +602,13 @@ def main() -> None:
     parser.add_argument("--orientation_step", type=float, default=PAPER_ORIENTATION_STEP)
     parser.add_argument("--max_candidates", type=int, default=512)
     parser.add_argument("--manager_top_k", type=int, default=PAPER_MANAGER_TOP_K)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--replay_size", type=int, default=30000)
     parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--manager_lr", type=float, default=1e-3)
     parser.add_argument("--worker_lr", type=float, default=1e-3)
+    parser.add_argument("--stage2_lr", type=float, default=1e-4,
+                        help="Learning rate for joint training stage (paper: 1e-4). Replaces initial LR when joint phase begins.")
     parser.add_argument("--manager_hidden_dim", type=int, default=128)
     parser.add_argument("--worker_hidden_dim", type=int, default=256)
     parser.add_argument("--target_update", type=int, default=100)
@@ -788,6 +790,7 @@ def main() -> None:
     )
     global_step = 0
     best_success = -1.0
+    joint_phase_entered = False
     recent_success: deque[float] = deque(maxlen=50)
     stage1_episodes = int(max(0, min(args.stage1_episodes, args.episodes)))
     manager_update_interval = int(max(1, args.manager_update_interval_epochs))
@@ -892,6 +895,27 @@ def main() -> None:
         is_joint_phase = ep_idx >= stage1_episodes
         joint_epoch_idx = max(0, ep_idx - stage1_episodes)
         manager_update_due = is_joint_phase and (joint_epoch_idx % manager_update_interval == 0)
+
+        # Paper: LR drops from 1e-3 (stage 1) to 1e-4 (stage 2) at joint phase entry
+        if is_joint_phase and not joint_phase_entered:
+            joint_phase_entered = True
+            for pg in manager_opt.param_groups:
+                pg["lr"] = args.stage2_lr
+            for pg in worker_opt.param_groups:
+                pg["lr"] = args.stage2_lr
+            # Re-anchor cosine scheduler base LRs to stage2_lr for joint phase duration
+            if manager_scheduler is not None:
+                manager_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    manager_opt,
+                    T_max=max(1, args.episodes - stage1_episodes - args.lr_warmup_episodes),
+                    eta_min=1e-6,
+                )
+                worker_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    worker_opt,
+                    T_max=max(1, args.episodes - stage1_episodes - args.lr_warmup_episodes),
+                    eta_min=1e-6,
+                )
+            print(f"joint_phase_start ep={ep_idx} lr_reset={args.stage2_lr:.2e}")
 
         m_losses: list[float] = []
         w_losses: list[float] = []
