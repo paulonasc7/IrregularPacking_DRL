@@ -46,22 +46,43 @@ def optimize_step(
     gamma: float,
     device: torch.device,
     max_grad_norm: float = 1.0,
+    grad_accum_steps: int = 1,
 ) -> float | None:
+    """Single optimization step with optional gradient accumulation.
+    
+    When grad_accum_steps > 1, splits the effective batch into micro-batches
+    to reduce peak GPU memory while achieving equivalent gradient updates.
+    
+    Args:
+        grad_accum_steps: Number of micro-batches to accumulate. Effective batch
+            size = batch_size. Micro-batch size = batch_size // grad_accum_steps.
+    """
     if len(replay) < batch_size:
         return None
 
-    maps, scalars, rewards, next_max_q, done = replay.sample_tensors(batch_size=batch_size, device=device)
-
-    pred = q_net(maps, scalars)
-    target = rewards + (1.0 - done) * gamma * next_max_q
-    loss = F.smooth_l1_loss(pred, target.detach())
-
+    micro_batch_size = max(1, batch_size // grad_accum_steps)
+    total_loss = 0.0
+    
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    
+    for step_idx in range(grad_accum_steps):
+        maps, scalars, rewards, next_max_q, done = replay.sample_tensors(
+            batch_size=micro_batch_size, device=device
+        )
+
+        pred = q_net(maps, scalars)
+        target = rewards + (1.0 - done) * gamma * next_max_q
+        # Scale loss by accumulation steps so total gradient magnitude is correct
+        loss = F.smooth_l1_loss(pred, target.detach()) / grad_accum_steps
+        loss.backward()
+        total_loss += loss.item()
+    
     if max_grad_norm > 0:
         torch.nn.utils.clip_grad_norm_(q_net.parameters(), max_grad_norm)
     optimizer.step()
-    return float(loss.item())
+    
+    # Return unscaled loss for logging (multiply back by accum_steps)
+    return float(total_loss * grad_accum_steps)
 
 
 class HRLPackingAgent:

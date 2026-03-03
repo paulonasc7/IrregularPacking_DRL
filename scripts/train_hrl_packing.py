@@ -603,6 +603,10 @@ def main() -> None:
     parser.add_argument("--max_candidates", type=int, default=512)
     parser.add_argument("--manager_top_k", type=int, default=PAPER_MANAGER_TOP_K)
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--grad_accum_steps", type=int, default=2,
+                        help="Gradient accumulation steps. Effective batch = batch_size, "
+                             "micro-batch = batch_size // grad_accum_steps. Use 2 for effective "
+                             "batch=128 on 16GB GPUs (paper default).")
     parser.add_argument("--replay_size", type=int, default=30000)
     parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--manager_lr", type=float, default=1e-3)
@@ -945,6 +949,7 @@ def main() -> None:
                     gamma=args.gamma,
                     device=device,
                     max_grad_norm=args.max_grad_norm,
+                    grad_accum_steps=args.grad_accum_steps,
                 )
                 if ml is not None:
                     m_losses.append(ml)
@@ -959,6 +964,7 @@ def main() -> None:
                 gamma=args.gamma,
                 device=device,
                 max_grad_norm=args.max_grad_norm,
+                grad_accum_steps=args.grad_accum_steps,
             )
             if wl is not None:
                 w_losses.append(wl)
