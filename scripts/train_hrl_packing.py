@@ -874,7 +874,7 @@ def main() -> None:
     summary_interval = 50  # Print summary every N episodes
 
     def process_episode_result(ep_idx: int, ep_result: dict[str, Any]) -> None:
-        nonlocal best_success, global_step
+        nonlocal best_success, global_step, joint_phase_entered, manager_scheduler, worker_scheduler
 
         # Track for summary
         recent_rewards.append(float(ep_result["reward"]))
