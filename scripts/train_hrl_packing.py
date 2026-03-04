@@ -804,9 +804,9 @@ def main() -> None:
         seed=args.seed,
     )
     global_step = 0
-    best_success = -1.0
+    best_packed = -1.0  # Track packed count (not binary success which is always 0)
     joint_phase_entered = False
-    recent_success: deque[float] = deque(maxlen=50)
+    packed_window: deque[float] = deque(maxlen=50)  # Rolling window for best model selection
     stage1_episodes = int(max(0, min(args.stage1_episodes, args.episodes)))
     manager_update_interval = int(max(1, args.manager_update_interval_epochs))
     start_ep = 0
@@ -834,10 +834,10 @@ def main() -> None:
             rng.bit_generator.state = ckpt["rng_state"]
         start_ep = int(ckpt.get("next_ep", 0))
         global_step = int(ckpt.get("global_step", 0))
-        best_success = float(ckpt.get("best_success", -1.0))
-        for v in ckpt.get("recent_success", []):
-            recent_success.append(float(v))
-        print(f"resume=ok next_ep={start_ep} global_step={global_step} best_success={best_success:.4f}")
+        best_packed = float(ckpt.get("best_packed", ckpt.get("best_success", -1.0)))  # backward compat
+        for v in ckpt.get("packed_window", ckpt.get("recent_packed", ckpt.get("recent_success", []))):
+            packed_window.append(float(v))
+        print(f"resume=ok next_ep={start_ep} global_step={global_step} best_packed={best_packed:.1f}")
 
     def save_checkpoint(ep_idx: int, path: str) -> None:
         """Save a full resumable checkpoint (all state needed to continue training)."""
@@ -846,8 +846,8 @@ def main() -> None:
         ckpt_data: dict = {
                 "next_ep": ep_idx + 1,
                 "global_step": global_step,
-                "best_success": best_success,
-                "recent_success": list(recent_success),
+                "best_packed": best_packed,
+                "packed_window": list(packed_window),
                 "manager_q_state_dict": manager_q.state_dict(),
                 "manager_t_state_dict": manager_t.state_dict(),
                 "worker_q_state_dict": worker_q.state_dict(),
@@ -878,7 +878,7 @@ def main() -> None:
     summary_interval = 50  # Print summary every N episodes
 
     def process_episode_result(ep_idx: int, ep_result: dict[str, Any]) -> None:
-        nonlocal best_success, global_step, joint_phase_entered, manager_scheduler, worker_scheduler
+        nonlocal best_packed, global_step, joint_phase_entered, manager_scheduler, worker_scheduler
 
         # Track for summary
         recent_rewards.append(float(ep_result["reward"]))
@@ -989,12 +989,13 @@ def main() -> None:
         if args.checkpoint_every > 0 and (ep_idx + 1) % args.checkpoint_every == 0:
             save_checkpoint(ep_idx, args.checkpoint_path)
 
-        success = float(ep_result["success"])
-        recent_success.append(success)
-        moving_success = float(np.mean(recent_success)) if recent_success else 0.0
+        # Track packed count for best model selection (using packed_window deque)
+        ep_packed = float(ep_result.get("packed_count", 0))
+        packed_window.append(ep_packed)
+        moving_packed = float(np.mean(packed_window)) if packed_window else 0.0
 
-        if moving_success >= best_success:
-            best_success = moving_success
+        if moving_packed >= best_packed:
+            best_packed = moving_packed
             torch.save(
                 {
                     "manager_state_dict": manager_q.state_dict(),
@@ -1011,7 +1012,7 @@ def main() -> None:
                     "manager_update_interval_epochs": manager_update_interval,
                     "args": vars(args),
                     "global_step": global_step,
-                    "moving_success": moving_success,
+                    "moving_packed": moving_packed,
                 },
                 args.save_path,
             )
@@ -1175,7 +1176,7 @@ def main() -> None:
 
     if args.num_workers == 1:
         env.close()
-    print(f"training_done save_path={args.save_path} best_moving_success={best_success:.3f}")
+    print(f"training_done save_path={args.save_path} best_moving_packed={best_packed:.1f}")
 
 
 if __name__ == "__main__":
