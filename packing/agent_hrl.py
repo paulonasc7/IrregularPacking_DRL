@@ -38,6 +38,33 @@ def max_q(q_net, map_states: np.ndarray, scalar_states: np.ndarray, device: torc
         return float(torch.max(q_net(map_tensor, scalar_tensor)).item())
 
 
+def double_dqn_max_q(
+    q_net,
+    target_net,
+    map_states: np.ndarray,
+    scalar_states: np.ndarray,
+    device: torch.device,
+) -> float:
+    """Double DQN: select action with online network, evaluate with target network.
+    
+    Standard DQN: max_a' Q_target(s', a')
+    Double DQN:   Q_target(s', argmax_a' Q_online(s', a'))
+    
+    This reduces overestimation bias in Q-values.
+    """
+    if map_states.shape[0] == 0:
+        return 0.0
+    with torch.no_grad():
+        map_tensor = torch.from_numpy(map_states.astype(np.float32)).to(device)
+        scalar_tensor = torch.from_numpy(scalar_states.astype(np.float32)).to(device)
+        # Select best action using ONLINE network
+        q_online = q_net(map_tensor, scalar_tensor)
+        best_idx = int(torch.argmax(q_online).item())
+        # Evaluate that action using TARGET network
+        q_target = target_net(map_tensor, scalar_tensor)
+        return float(q_target[best_idx].item())
+
+
 def optimize_step(
     q_net,
     optimizer: torch.optim.Optimizer,

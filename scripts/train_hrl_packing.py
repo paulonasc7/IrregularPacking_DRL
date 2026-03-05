@@ -17,7 +17,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from packing import PackingEnv
-from packing.agent_hrl import argmax_q_index, epsilon_by_episode, max_q, optimize_step, set_seed
+from packing.agent_hrl import argmax_q_index, double_dqn_max_q, epsilon_by_episode, max_q, optimize_step, set_seed
 from packing.models_manager import ManagerQNet
 from packing.models_worker import WorkerQNet
 from packing.replay import HierarchicalReplay, QTransition, ReplayBuffer
@@ -217,6 +217,61 @@ def max_worker_q_scoremap(
     if best <= (-1e30):
         return 0.0
     return best
+
+
+def double_dqn_max_worker_q_scoremap(
+    q_net: WorkerQNet,
+    target_net: WorkerQNet,
+    orientation_candidates: list[dict],
+    device: torch.device,
+) -> float:
+    """Double DQN for worker: select position with online network, evaluate with target.
+    
+    Standard DQN: max Q_target over all positions
+    Double DQN:   Q_target at position selected by argmax Q_online
+    """
+    if len(orientation_candidates) == 0:
+        return 0.0
+    with torch.no_grad():
+        if "map_state_t" in orientation_candidates[0]:
+            batch_cache = orientation_candidates[0].get("_batch_cache")
+            if batch_cache is not None:
+                maps = batch_cache["maps_t"]
+                legal_masks = batch_cache["legal_masks_t"]
+            else:
+                maps = torch.stack([c["map_state_t"] for c in orientation_candidates], dim=0)
+                legal_masks = torch.stack([c["legal_mask_t"] for c in orientation_candidates], dim=0)
+        else:
+            maps = torch.from_numpy(np.stack([c["map_state"] for c in orientation_candidates], axis=0)).to(device)
+            legal_masks = torch.from_numpy(
+                np.stack([c["legal_mask"] > 0.5 for c in orientation_candidates], axis=0)
+            ).to(device)
+        
+        neg_inf = torch.finfo(maps.dtype).min
+        
+        # Use ONLINE network to select best (orientation, x, y) position
+        scores_online = q_net.score_map(maps).squeeze(1)
+        masked_online = scores_online.masked_fill(~legal_masks, neg_inf)
+        
+        # Find the best position across all orientations
+        # Shape of masked_online: (num_orientations, H, W)
+        best_flat_idx = int(torch.argmax(masked_online).item())
+        
+        # Convert flat index to (orientation, row, col)
+        num_oris = masked_online.shape[0]
+        h, w = masked_online.shape[1], masked_online.shape[2]
+        ori_idx = best_flat_idx // (h * w)
+        spatial_idx = best_flat_idx % (h * w)
+        row_idx = spatial_idx // w
+        col_idx = spatial_idx % w
+        
+        # Use TARGET network to evaluate Q at that position
+        scores_target = target_net.score_map(maps).squeeze(1)
+        best_q = float(scores_target[ori_idx, row_idx, col_idx].item())
+    
+    if best_q <= (-1e30):
+        return 0.0
+    return best_q
 
 
 def _init_rollout_worker(init_cfg: dict[str, Any]) -> None:
@@ -422,8 +477,9 @@ def rollout_episode(
                 nm_cands = manager_candidates(env, next_state["unpacked"], max_objects_k=manager_top_k)
                 nm_maps = np.stack([c[0] for c in nm_cands], axis=0).astype(np.float32)
                 nm_scalars = np.stack([c[1] for c in nm_cands], axis=0).astype(np.float32)
-                next_m_max_q = max_q(manager_t, nm_maps, nm_scalars, device)
-                nm_idx = argmax_q_index(manager_t, nm_maps, nm_scalars, device)
+                # Double DQN: select action with online network, evaluate with target
+                next_m_max_q = double_dqn_max_q(manager_q, manager_t, nm_maps, nm_scalars, device)
+                nm_idx = argmax_q_index(manager_q, nm_maps, nm_scalars, device)  # Use online net for selection
                 next_item = nm_cands[nm_idx][2]
             else:
                 next_m_max_q = 0.0
@@ -439,7 +495,8 @@ def rollout_episode(
                 next_w_max_q = 0.0
                 cached_w_cands = None
             else:
-                next_w_max_q = max_worker_q_scoremap(worker_t, nw_cands, device)
+                # Double DQN for worker
+                next_w_max_q = double_dqn_max_worker_q_scoremap(worker_q, worker_t, nw_cands, device)
                 # Cache for potential reuse in next iteration
                 cached_w_cands = (next_item, nw_cands)
 
