@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Training outputs (large files, regenerated)
+logs/data/
+logs/models/
+logs/visualizations/
+logs/transitions/
+logs/*.pstats
+logs/*.npy
+logs/
+
+# Keep the trained model checkpoint
+!logs/packing_hrl.pt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local-only tooling (contains the Paperspace URL + token)
+remote.py
